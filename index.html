@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Attendance Dashboard</title>
+<script src="https://cdn.tailwindcss.com/3.4.17"></script>
+</head>
+<body class="bg-slate-900 text-slate-100 min-h-screen">
+<header class="flex items-center justify-between px-4 py-3 bg-slate-800 border-b border-slate-700">
+  <h1 class="font-bold text-lg">Attendance Dashboard</h1>
+  <a href="/scan" class="px-3 py-1.5 rounded bg-emerald-600 hover:bg-emerald-500 text-sm font-semibold">Open Scanner</a>
+</header>
+
+<div id="toast" class="hidden fixed top-3 right-3 z-50 px-4 py-2 rounded bg-rose-600 text-sm shadow"></div>
+
+<main class="max-w-6xl mx-auto p-4 grid gap-4 md:grid-cols-[240px_1fr]">
+  <aside>
+    <button id="newClass" class="w-full mb-3 px-3 py-2 rounded bg-indigo-600 hover:bg-indigo-500 font-semibold text-sm">+ New class</button>
+    <div id="classList" class="space-y-2"></div>
+  </aside>
+  <section id="panel" class="space-y-4"></section>
+</main>
+
+<script>
+const $ = s => document.querySelector(s);
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const inp = "w-full px-2 py-1.5 rounded bg-slate-900 border border-slate-600 text-sm";
+const card = "bg-slate-800 border border-slate-700 rounded-lg p-4";
+
+function toast(msg) {
+  const t = $("#toast"); t.textContent = msg; t.classList.remove("hidden");
+  clearTimeout(toast.h); toast.h = setTimeout(() => t.classList.add("hidden"), 4000);
+}
+async function api(path, opts = {}) {
+  const r = await fetch(path, opts);
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || r.statusText);
+  return data;
+}
+function resizeImage(file, max = 480) {
+  return new Promise((res, rej) => {
+    const img = new Image();
+    img.onload = () => {
+      const s = Math.min(1, max / Math.max(img.width, img.height));
+      const c = document.createElement("canvas");
+      c.width = Math.round(img.width * s); c.height = Math.round(img.height * s);
+      c.getContext("2d").drawImage(img, 0, 0, c.width, c.height);
+      URL.revokeObjectURL(img.src);
+      c.toBlob(b => b ? res(b) : rej(new Error("Resize failed")), "image/jpeg", 0.88);
+    };
+    img.onerror = () => rej(new Error("Could not read image"));
+    img.src = URL.createObjectURL(file);
+  });
+}
+
+let classes = [];
+let editing = null; // null | {} (new) | class object
+
+async function loadClasses() {
+  classes = await api("/api/classes");
+  if (editing && editing.id) editing = classes.find(c => c.id === editing.id) || null;
+  renderList(); renderPanel();
+}
+
+function renderList() {
+  $("#classList").innerHTML = classes.map(c => `
+    <button data-id="${c.id}" class="w-full text-left px-3 py-2 rounded border ${editing && editing.id === c.id ? "border-indigo-400 bg-slate-700" : "border-slate-700 bg-slate-800"} hover:bg-slate-700">
+      <div class="font-semibold text-sm">${esc(c.name)}</div>
+      <div class="text-xs text-slate-400">${esc(c.start_time)} – ${esc(c.end_time)}</div>
+    </button>`).join("") || `<p class="text-sm text-slate-400">No classes yet.</p>`;
+}
+
+function renderPanel() {
+  const p = $("#panel");
+  if (!editing) { p.innerHTML = `<p class="text-slate-400">Select a class or create a new one.</p>`; return; }
+  const c = editing, isNew = !c.id;
+  const tz = c.timezone || Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+  p.innerHTML = `
+  <form id="classForm" class="${card} grid gap-3 sm:grid-cols-2">
+    <h2 class="sm:col-span-2 font-semibold">${isNew ? "New class" : "Class settings"}</h2>
+    <label class="text-xs">Name<input name="name" required class="${inp}" value="${esc(c.name)}"></label>
+    <label class="text-xs">Timezone (IANA)<input name="timezone" class="${inp}" value="${esc(tz)}"></label>
+    <label class="text-xs">Start time<input type="time" name="start_time" required class="${inp}" value="${esc(c.start_time || "09:00")}"></label>
+    <label class="text-xs">End time<input type="time" name="end_time" required class="${inp}" value="${esc(c.end_time || "09:30")}"></label>
+    <label class="text-xs flex items-center gap-2 sm:col-span-2"><input type="checkbox" name="anti_spam_enabled" ${c.anti_spam_enabled ? "checked" : ""}> Anti-spam enabled</label>
+    <label class="text-xs">Anti-spam mode
+      <select name="anti_spam_mode" class="${inp}">
+        <option value="cooldown" ${c.anti_spam_mode !== "once_per_session" ? "selected" : ""}>Timed cooldown</option>
+        <option value="once_per_session" ${c.anti_spam_mode === "once_per_session" ? "selected" : ""}>Once per session</option>
+      </select></label>
+    <label class="text-xs">Cooldown (minutes)<input type="number" min="1" name="cooldown_minutes" class="${inp}" value="${c.cooldown_minutes || 5}"></label>
+    <label class="text-xs">Unknown face threshold (seconds)<input type="number" min="1" name="unknown_threshold_sec" class="${inp}" value="${c.unknown_threshold_sec || 5}"></label>
+    <label class="text-xs">Webhook URL (Discord / WhatsApp gateway / custom)<input name="webhook_url" class="${inp}" value="${esc(c.webhook_url)}" placeholder="https://..."></label>
+    <div class="sm:col-span-2 flex gap-2">
+      <button class="px-3 py-1.5 rounded bg-indigo-600 hover:bg-indigo-500 text-sm font-semibold">${isNew ? "Create" : "Save"}</button>
+      ${isNew ? "" : `<button type="button" id="delClass" class="px-3 py-1.5 rounded bg-rose-700 hover:bg-rose-600 text-sm">Delete class</button>`}
+    </div>
+  </form>
+  ${isNew ? "" : `
+  <div class="${card}">
+    <h2 class="font-semibold mb-3">Roster</h2>
+    <form id="studentForm" class="flex flex-wrap gap-2 mb-3">
+      <input name="name" required placeholder="Student name" class="${inp} flex-1 min-w-[140px]">
+      <input type="file" name="image" accept="image/*" required class="text-xs flex-1 min-w-[160px]">
+      <button class="px-3 py-1.5 rounded bg-emerald-600 hover:bg-emerald-500 text-sm font-semibold">Add</button>
+    </form>
+    <p class="text-xs text-slate-400 mb-3">Use a clear, front-facing photo with one face.</p>
+    <div id="roster" class="grid grid-cols-2 sm:grid-cols-4 gap-3"></div>
+  </div>
+  <div class="${card}">
+    <div class="flex flex-wrap items-center justify-between gap-2 mb-3">
+      <h2 class="font-semibold">Attendance log</h2>
+      <div class="flex gap-2 text-xs">
+        <button id="refreshLogs" class="px-2 py-1 rounded bg-slate-700">Refresh</button>
+        <a class="px-2 py-1 rounded bg-slate-700" href="/api/logs?class_id=${c.id}&format=csv">Export CSV</a>
+        <a class="px-2 py-1 rounded bg-slate-700" href="/api/logs?class_id=${c.id}&format=json">Export JSON</a>
+      </div>
+    </div>
+    <div class="overflow-x-auto"><table class="w-full text-sm">
+      <thead class="text-left text-slate-400 text-xs"><tr><th class="py-1 pr-3">Time</th><th class="pr-3">Student</th><th class="pr-3">Status</th><th>Snapshot</th></tr></thead>
+      <tbody id="logBody"></tbody></table></div>
+  </div>`}`;
+
+  $("#classForm").onsubmit = saveClass;
+  if (!isNew) {
+    $("#delClass").onclick = deleteClass;
+    $("#studentForm").onsubmit = addStudent;
+    $("#refreshLogs").onclick = loadLogs;
+    loadRoster(); loadLogs();
+  }
+}
+
+async function saveClass(e) {
+  e.preventDefault();
+  const f = new FormData(e.target);
+  const body = Object.fromEntries(f.entries());
+  body.anti_spam_enabled = f.has("anti_spam_enabled");
+  try {
+    const saved = editing.id
+      ? await api(`/api/classes/${editing.id}`, { method: "PUT", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body) })
+      : await api("/api/classes", { method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body) });
+    editing = saved; await loadClasses();
+  } catch (err) { toast(err.message); }
+}
+async function deleteClass() {
+  if (!confirm("Delete this class, its students and all logs?")) return;
+  try { await api(`/api/classes/${editing.id}`, { method: "DELETE" }); editing = null; await loadClasses(); }
+  catch (err) { toast(err.message); }
+}
+
+async function loadRoster() {
+  const list = await api(`/api/classes/${editing.id}/students`);
+  $("#roster").innerHTML = list.map(s => `
+    <div class="bg-slate-900 rounded p-2 text-center">
+      <img src="${s.image_url}" class="w-full aspect-square object-cover rounded mb-1" alt="">
+      <div class="text-xs font-semibold truncate">${esc(s.name)}</div>
+      <button data-del="${s.id}" class="text-xs text-rose-400 hover:underline">Remove</button>
+    </div>`).join("") || `<p class="text-sm text-slate-400 col-span-full">No students yet.</p>`;
+}
+async function addStudent(e) {
+  e.preventDefault();
+  const f = new FormData(e.target);
+  try {
+    const blob = await resizeImage(f.get("image"));
+    const body = new FormData();
+    body.append("name", f.get("name"));
+    body.append("image", blob, "photo.jpg");
+    await api(`/api/classes/${editing.id}/students`, { method: "POST", body });
+    e.target.reset(); loadRoster();
+  } catch (err) { toast(err.message); }
+}
+
+async function loadLogs() {
+  const rows = await api(`/api/logs?class_id=${editing.id}&limit=200`);
+  $("#logBody").innerHTML = rows.map(r => `
+    <tr class="border-t border-slate-700">
+      <td class="py-1 pr-3 whitespace-nowrap">${esc(r.local_time)}</td>
+      <td class="pr-3">${esc(r.student_name)}</td>
+      <td class="pr-3 ${r.status === "unknown" ? "text-amber-400" : "text-emerald-400"}">${esc(r.status)}</td>
+      <td>${r.snapshot_url ? `<a class="text-indigo-400 underline" target="_blank" href="${r.snapshot_url}">view</a>` : ""}</td>
+    </tr>`).join("") || `<tr><td colspan="4" class="py-2 text-slate-400">No entries yet.</td></tr>`;
+}
+
+$("#newClass").onclick = () => { editing = {}; renderList(); renderPanel(); };
+$("#classList").onclick = e => {
+  const b = e.target.closest("[data-id]"); if (!b) return;
+  editing = classes.find(c => c.id === b.dataset.id); renderList(); renderPanel();
+};
+$("#panel").onclick = async e => {
+  const id = e.target.dataset.del; if (!id) return;
+  try { await api(`/api/students/${id}`, { method: "DELETE" }); loadRoster(); } catch (err) { toast(err.message); }
+};
+
+loadClasses().catch(err => toast(err.message));
+</script>
+</body>
+</html>
