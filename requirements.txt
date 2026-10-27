@@ -1,0 +1,5 @@
+Flask==3.0.3
+pymongo[srv]==4.8.0
+requests==2.32.3
+gunicorn==22.0.0
+tzdata==2024.1
