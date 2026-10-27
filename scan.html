@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Attendance Scanner</title>
+<script src="https://cdn.tailwindcss.com/3.4.17"></script>
+<script src="https://cdn.jsdelivr.net/npm/@vladmandic/face-api@1.7.13/dist/face-api.js"></script>
+</head>
+<body class="bg-slate-900 text-slate-100 min-h-screen">
+<header class="flex flex-wrap items-center gap-2 px-4 py-3 bg-slate-800 border-b border-slate-700">
+  <a href="/" class="text-sm text-slate-300 hover:underline">← Dashboard</a>
+  <select id="classSel" class="px-2 py-1.5 rounded bg-slate-900 border border-slate-600 text-sm"></select>
+  <button id="startBtn" class="px-3 py-1.5 rounded bg-emerald-600 hover:bg-emerald-500 text-sm font-semibold">Start</button>
+  <div class="ml-auto flex flex-wrap gap-2 text-xs">
+    <span id="winPill" class="px-2 py-1 rounded bg-slate-700">Idle</span>
+    <span id="netPill" class="px-2 py-1 rounded bg-slate-700">Online</span>
+    <span id="qPill" class="px-2 py-1 rounded bg-slate-700">Queue: 0</span>
+  </div>
+</header>
+
+<main class="max-w-3xl mx-auto p-4 space-y-3">
+  <div class="relative bg-black rounded-lg overflow-hidden">
+    <video id="video" class="w-full block" autoplay playsinline muted></video>
+    <canvas id="overlay" class="absolute inset-0 w-full h-full"></canvas>
+    <div id="badge" class="hidden absolute bottom-3 left-3 right-3 sm:right-auto sm:w-80 flex items-center gap-3 p-3 rounded-lg shadow-lg"></div>
+  </div>
+  <p id="status" class="text-sm text-slate-400">Pick a class and press Start.</p>
+  <ul id="events" class="text-sm space-y-1"></ul>
+</main>
+
+<script>
+const MODEL_URL = "https://cdn.jsdelivr.net/npm/@vladmandic/face-api@1.7.13/model";
+const MATCH_THRESHOLD = 0.5;
+const $ = s => document.querySelector(s);
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const video = $("#video"), overlay = $("#overlay");
+
+let cls = null, matcher = null, roster = {}, running = false, stream = null;
+let marks = new Map(), unknownSince = null, lastUnknownShot = 0, modelsLoaded = false, ac = null;
+
+// ---------- offline queue (IndexedDB) ----------
+const idb = new Promise((res, rej) => {
+  const r = indexedDB.open("attendance-queue", 1);
+  r.onupgradeneeded = () => r.result.createObjectStore("q", { keyPath: "client_id" });
+  r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error);
+});
+const tx = (mode, fn) => idb.then(db => new Promise((res, rej) => {
+  const t = db.transaction("q", mode); const r = fn(t.objectStore("q"));
+  t.oncomplete = () => res(r.result); t.onerror = () => rej(t.error);
+}));
+const qPut = i => tx("readwrite", s => s.put(i));
+const qDel = k => tx("readwrite", s => s.delete(k));
+const qAll = () => tx("readonly", s => s.getAll());
+async function updateQueueCount() { $("#qPill").textContent = "Queue: " + (await qAll()).length; }
+
+let flushing = false;
+async function flush() {
+  if (flushing || !navigator.onLine) return;
+  flushing = true;
+  try {
+    for (const item of await qAll()) {
+      try {
+        const r = await fetch(item.kind === "unknown" ? "/api/unknown" : "/api/attendance", {
+          method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(item.body) });
+        if (r.status >= 500) break;
+        await qDel(item.client_id); // success, duplicate, or permanent 4xx
+      } catch { break; }
+    }
+  } finally { flushing = false; updateQueueCount(); }
+}
+
+async function send(kind, body) {
+  body.client_id = crypto.randomUUID();
+  body.client_ts = new Date().toISOString();
+  try {
+    if (!navigator.onLine) throw 0;
+    const r = await fetch(kind === "unknown" ? "/api/unknown" : "/api/attendance", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    if (r.status >= 500) throw 0;
+    return await r.json();
+  } catch {
+    await qPut({ client_id: body.client_id, kind, body });
+    updateQueueCount();
+    return { status: "queued" };
+  }
+}
+
+// ---------- time window + anti-spam (client side mirror; server is authoritative) ----------
+const localHM = tz => new Intl.DateTimeFormat("en-GB", { timeZone: tz, hour: "2-digit", minute: "2-digit", hourCycle: "h23" }).format(new Date());
+const dayKey = tz => new Intl.DateTimeFormat("en-CA", { timeZone: tz }).format(new Date());
+function windowActive(c) {
+  const t = localHM(c.timezone), s = c.start_time, e = c.end_time;
+  return s <= e ? (t >= s && t <= e) : (t >= s || t <= e);
+}
+function localBlocked(c, id) {
+  const m = marks.get(id); if (!m) return false;
+  const age = Date.now() - m.t;
+  if (age < 8000) return true;
+  if (!c.anti_spam_enabled) return false;
+  if (c.anti_spam_mode === "once_per_session") return m.day === dayKey(c.timezone);
+  return age < c.cooldown_minutes * 60000;
+}
+
+// ---------- feedback ----------
+function chime() {
+  if (!ac) return;
+  const t = ac.currentTime;
+  [[880, 0], [1318.5, 0.12]].forEach(([f, d]) => {
+    const o = ac.createOscillator(), g = ac.createGain();
+    o.type = "sine"; o.frequency.value = f;
+    g.gain.setValueAtTime(0, t + d);
+    g.gain.linearRampToValueAtTime(0.25, t + d + 0.02);
+    g.gain.exponentialRampToValueAtTime(0.001, t + d + 0.5);
+    o.connect(g).connect(ac.destination); o.start(t + d); o.stop(t + d + 0.55);
+  });
+}
+function showBadge(kind, id, name) {
+  const styles = {
+    marked: ["bg-emerald-600", "Attendance Marked"],
+    queued: ["bg-sky-600", "Saved offline – will sync"],
+    duplicate: ["bg-amber-600", "Already marked"],
+  }[kind];
+  const b = $("#badge");
+  b.className = `absolute bottom-3 left-3 right-3 sm:right-auto sm:w-80 flex items-center gap-3 p-3 rounded-lg shadow-lg ${styles[0]}`;
+  b.innerHTML = `<img src="/api/students/${id}/image" onerror="this.remove()" class="w-14 h-14 rounded object-cover bg-black/30" alt="">
+    <div><div class="font-bold">${esc(name)}</div><div class="text-sm opacity-90">${styles[1]}</div></div>`;
+  clearTimeout(showBadge.h); showBadge.h = setTimeout(() => b.classList.add("hidden"), 3000);
+  if (kind !== "duplicate") chime();
+  addEvent(`${new Date().toLocaleTimeString()} – ${name}: ${styles[1]}`);
+}
+function addEvent(t) {
+  const li = document.createElement("li"); li.textContent = t; li.className = "text-slate-300";
+  $("#events").prepend(li); while ($("#events").children.length > 8) $("#events").lastChild.remove();
+}
+const setStatus = t => $("#status").textContent = t;
+
+// ---------- roster + descriptors ----------
+async function loadModels() {
+  if (modelsLoaded) return;
+  await Promise.all([
+    faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL),
+    faceapi.nets.faceLandmark68Net.loadFromUri(MODEL_URL),
+    faceapi.nets.faceRecognitionNet.loadFromUri(MODEL_URL),
+  ]);
+  modelsLoaded = true;
+}
+async function buildMatcher() {
+  let list;
+  try {
+    list = await (await fetch(`/api/classes/${cls.id}/students`)).json();
+    localStorage.setItem("roster:" + cls.id, JSON.stringify(list));
+  } catch { list = JSON.parse(localStorage.getItem("roster:" + cls.id) || "[]"); }
+  roster = Object.fromEntries(list.map(s => [s.id, s]));
+  const labeled = [], failed = [];
+  for (const [i, s] of list.entries()) {
+    setStatus(`Preparing roster ${i + 1}/${list.length}…`);
+    let desc = null;
+    try { desc = JSON.parse(localStorage.getItem("fd:" + s.id)); } catch {}
+    if (!desc) {
+      try {
+        const img = await faceapi.fetchImage(s.image_url);
+        const d = await faceapi.detectSingleFace(img, new faceapi.TinyFaceDetectorOptions({ inputSize: 416, scoreThreshold: 0.3 }))
+          .withFaceLandmarks().withFaceDescriptor();
+        if (d) { desc = Array.from(d.descriptor); localStorage.setItem("fd:" + s.id, JSON.stringify(desc)); }
+      } catch {}
+    }
+    if (desc) labeled.push(new faceapi.LabeledFaceDescriptors(s.id, [new Float32Array(desc)]));
+    else failed.push(s.name);
+  }
+  matcher = labeled.length ? new faceapi.FaceMatcher(labeled, MATCH_THRESHOLD) : null;
+  if (failed.length) addEvent("No face found in photo for: " + failed.join(", "));
+  if (!matcher) addEvent("No usable student photos – everyone will count as unknown.");
+}
+
+// ---------- main loop ----------
+function drawBoxes(items) {
+  const ctx = overlay.getContext("2d");
+  ctx.clearRect(0, 0, overlay.width, overlay.height);
+  ctx.lineWidth = 3; ctx.font = "16px sans-serif";
+  for (const { box, label, known } of items) {
+    ctx.strokeStyle = known ? "#10b981" : "#f59e0b"; ctx.fillStyle = ctx.strokeStyle;
+    ctx.strokeRect(box.x, box.y, box.width, box.height);
+    ctx.fillText(label, box.x + 4, Math.max(16, box.y - 6));
+  }
+}
+
+async function loop() {
+  if (!running) return;
+  try {
+    const active = windowActive(cls);
+    const pill = $("#winPill");
+    pill.textContent = active ? `Scanning (${cls.start_time}–${cls.end_time})` : `Outside window (${cls.start_time}–${cls.end_time})`;
+    pill.className = "px-2 py-1 rounded " + (active ? "bg-emerald-700" : "bg-slate-700");
+
+    if (!active) {
+      drawBoxes([]); unknownSince = null;
+    } else if (video.readyState >= 2) {
+      const dets = await faceapi.detectAllFaces(video, new faceapi.TinyFaceDetectorOptions({ inputSize: 320, scoreThreshold: 0.5 }))
+        .withFaceLandmarks().withFaceDescriptors();
+      const items = []; let anyUnknown = false;
+      for (const d of dets) {
+        const m = matcher ? matcher.findBestMatch(d.descriptor) : { label: "unknown" };
+        const known = m.label !== "unknown";
+        if (!known) anyUnknown = true;
+        items.push({ box: d.detection.box, label: known ? (roster[m.label]?.name || "?") : "Unknown", known, id: m.label });
+      }
+      drawBoxes(items);
+
+      for (const it of items) {
+        if (!it.known || localBlocked(cls, it.id)) continue;
+        marks.set(it.id, { t: Date.now(), day: dayKey(cls.timezone) });
+        const res = await send("attendance", { class_id: cls.id, student_id: it.id });
+        const name = roster[it.id]?.name || "Student";
+        if (res.status === "marked") showBadge("marked", it.id, name);
+        else if (res.status === "queued") showBadge("queued", it.id, name);
+        else if (res.status === "duplicate") showBadge("duplicate", it.id, name);
+      }
+
+      if (anyUnknown) {
+        unknownSince ??= Date.now();
+        if (Date.now() - unknownSince >= cls.unknown_threshold_sec * 1000 && Date.now() - lastUnknownShot > 60000) {
+          lastUnknownShot = Date.now();
+          const c = document.createElement("canvas");
+          c.width = video.videoWidth; c.height = video.videoHeight;
+          c.getContext("2d").drawImage(video, 0, 0);
+          await send("unknown", { class_id: cls.id, snapshot: c.toDataURL("image/jpeg", 0.8) });
+          addEvent(`${new Date().toLocaleTimeString()} – Unknown visitor captured`);
+        }
+      } else unknownSince = null;
+    }
+  } catch (e) { console.error(e); }
+  setTimeout(loop, 350);
+}
+
+// ---------- start / stop ----------
+async function start() {
+  if (!$("#classSel").value) return setStatus("Create a class on the dashboard first.");
+  $("#startBtn").disabled = true;
+  try {
+    ac = new (window.AudioContext || window.webkitAudioContext)(); // needs the click gesture
+    setStatus("Loading class…");
+    const all = await (await fetch("/api/classes")).json().catch(() => []);
+    cls = all.find(c => c.id === $("#classSel").value) || JSON.parse(localStorage.getItem("class:" + $("#classSel").value) || "null");
+    if (!cls) throw new Error("Could not load class (offline and not cached).");
+    localStorage.setItem("class:" + cls.id, JSON.stringify(cls));
+    setStatus("Loading face models…"); await loadModels();
+    await buildMatcher();
+    setStatus("Starting camera…");
+    stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "user", width: 640, height: 480 }, audio: false });
+    video.srcObject = stream;
+    await new Promise(r => video.onloadedmetadata = r);
+    overlay.width = video.videoWidth; overlay.height = video.videoHeight;
+    running = true; marks.clear(); unknownSince = null;
+    $("#startBtn").textContent = "Stop"; setStatus(`Scanning for ${cls.name}.`);
+    loop();
+  } catch (e) { setStatus("Error: " + e.message); }
+  $("#startBtn").disabled = false;
+}
+function stop() {
+  running = false;
+  stream?.getTracks().forEach(t => t.stop());
+  video.srcObject = null; drawBoxes([]);
+  $("#startBtn").textContent = "Start"; $("#winPill").textContent = "Idle"; $("#winPill").className = "px-2 py-1 rounded bg-slate-700";
+  setStatus("Stopped.");
+}
+$("#startBtn").onclick = () => running ? stop() : start();
+
+function setNet() {
+  $("#netPill").textContent = navigator.onLine ? "Online" : "Offline";
+  $("#netPill").className = "px-2 py-1 rounded " + (navigator.onLine ? "bg-slate-700" : "bg-rose-700");
+  if (navigator.onLine) flush();
+}
+window.addEventListener("online", setNet); window.addEventListener("offline", setNet);
+setInterval(flush, 15000);
+
+(async () => {
+  setNet(); updateQueueCount();
+  try {
+    const all = await (await fetch("/api/classes")).json();
+    $("#classSel").innerHTML = all.map(c => `<option value="${c.id}">${esc(c.name)}</option>`).join("");
+    all.forEach(c => localStorage.setItem("class:" + c.id, JSON.stringify(c)));
+  } catch {
+    const keys = Object.keys(localStorage).filter(k => k.startsWith("class:"));
+    $("#classSel").innerHTML = keys.map(k => { const c = JSON.parse(localStorage.getItem(k)); return `<option value="${c.id}">${esc(c.name)}</option>`; }).join("");
+  }
+})();
+</script>
+</body>
+</html>
