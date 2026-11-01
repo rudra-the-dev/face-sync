@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Attendance Dashboard</title>
 <script src="https://cdn.tailwindcss.com/3.4.17"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
 </head>
 <body class="bg-slate-900 text-slate-100 min-h-screen">
 <header class="flex items-center justify-between px-4 py-3 bg-slate-800 border-b border-slate-700">
@@ -56,6 +57,9 @@ function resizeImage(file, max = 480) {
 
 let classes = [];
 let editing = null; // null | {} (new) | class object
+let devices = [], lastDevJson = "", devTimer = null;
+const openPair = new Set();
+const KINDS = { esp32cam: "ESP32-CAM (camera)", phone: "Phone (camera)", display: "ST7735 display", speaker: "Satellite speaker" };
 
 async function loadClasses() {
   classes = await api("/api/classes");
@@ -91,13 +95,26 @@ function renderPanel() {
       </select></label>
     <label class="text-xs">Cooldown (minutes)<input type="number" min="1" name="cooldown_minutes" class="${inp}" value="${c.cooldown_minutes || 5}"></label>
     <label class="text-xs">Unknown face threshold (seconds)<input type="number" min="1" name="unknown_threshold_sec" class="${inp}" value="${c.unknown_threshold_sec || 5}"></label>
-    <label class="text-xs">Webhook URL (Discord / WhatsApp gateway / custom)<input name="webhook_url" class="${inp}" value="${esc(c.webhook_url)}" placeholder="https://..."></label>
+    ${isNew ? "" : `<label class="text-xs">Camera source
+      <select name="camera_source" id="camSel" disabled class="${inp}"><option value="browser">This scanner device's own camera</option></select></label>`}
+    <label class="text-xs flex items-center gap-2 self-end pb-2"><input type="checkbox" name="audio_local" ${c.audio_local === false ? "" : "checked"}> Play chime on the scanner device</label>
+    <label class="text-xs sm:col-span-2">Webhook URL (Discord / WhatsApp gateway / custom)<input name="webhook_url" class="${inp}" value="${esc(c.webhook_url)}" placeholder="https://..."></label>
     <div class="sm:col-span-2 flex gap-2">
       <button class="px-3 py-1.5 rounded bg-indigo-600 hover:bg-indigo-500 text-sm font-semibold">${isNew ? "Create" : "Save"}</button>
       ${isNew ? "" : `<button type="button" id="delClass" class="px-3 py-1.5 rounded bg-rose-700 hover:bg-rose-600 text-sm">Delete class</button>`}
     </div>
   </form>
   ${isNew ? "" : `
+  <div class="${card}">
+    <h2 class="font-semibold mb-1">Devices</h2>
+    <p class="text-xs text-slate-400 mb-3">Link an ESP32-CAM or a phone as this class's camera, plus an ESP32 with an ST7735 screen and/or a satellite speaker. Each class has its own devices.</p>
+    <form id="deviceForm" class="flex flex-wrap gap-2 mb-3">
+      <input name="name" required placeholder="Device name (e.g. Door cam)" class="${inp} flex-1 min-w-[160px]">
+      <select name="kind" class="${inp} flex-1 min-w-[160px]">${Object.entries(KINDS).map(([k, v]) => `<option value="${k}">${v}</option>`).join("")}</select>
+      <button class="px-3 py-1.5 rounded bg-indigo-600 hover:bg-indigo-500 text-sm font-semibold">Add device</button>
+    </form>
+    <div id="devices" class="space-y-2"></div>
+  </div>
   <div class="${card}">
     <h2 class="font-semibold mb-3">Roster</h2>
     <form id="studentForm" class="flex flex-wrap gap-2 mb-3">
@@ -122,9 +139,13 @@ function renderPanel() {
       <tbody id="logBody"></tbody></table></div>
   </div>`}`;
 
+  clearInterval(devTimer);
   $("#classForm").onsubmit = saveClass;
   if (!isNew) {
     $("#delClass").onclick = deleteClass;
+    $("#deviceForm").onsubmit = addDevice;
+    $("#devices").onclick = deviceClick;
+    lastDevJson = ""; clearInterval(devTimer); devTimer = setInterval(loadDevices, 5000); loadDevices();
     $("#studentForm").onsubmit = addStudent;
     $("#refreshLogs").onclick = loadLogs;
     loadRoster(); loadLogs();
@@ -136,6 +157,8 @@ async function saveClass(e) {
   const f = new FormData(e.target);
   const body = Object.fromEntries(f.entries());
   body.anti_spam_enabled = f.has("anti_spam_enabled");
+  body.audio_local = f.has("audio_local");
+  body.camera_source = body.camera_source || editing.camera_source || "browser";
   try {
     const saved = editing.id
       ? await api(`/api/classes/${editing.id}`, { method: "PUT", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body) })
@@ -147,6 +170,73 @@ async function deleteClass() {
   if (!confirm("Delete this class, its students and all logs?")) return;
   try { await api(`/api/classes/${editing.id}`, { method: "DELETE" }); editing = null; await loadClasses(); }
   catch (err) { toast(err.message); }
+}
+
+async function loadDevices() {
+  if (!editing || !editing.id) return;
+  try { devices = await api(`/api/classes/${editing.id}/devices`); } catch { return; }
+  const j = JSON.stringify(devices) + "|" + editing.camera_source;
+  if (j === lastDevJson) return;
+  lastDevJson = j; fillCamSel(); renderDevices();
+}
+function fillCamSel() {
+  const sel = $("#camSel"); if (!sel) return;
+  const keep = sel.disabled ? (editing.camera_source || "browser") : sel.value;
+  sel.innerHTML = `<option value="browser">This scanner device's own camera</option>` +
+    devices.filter(d => d.kind === "esp32cam" || d.kind === "phone")
+      .map(d => `<option value="${d.id}">${esc(d.name)} – ${KINDS[d.kind]}</option>`).join("");
+  sel.value = [...sel.options].some(o => o.value === keep) ? keep : "browser";
+  sel.disabled = false;
+}
+function renderDevices() {
+  const el = $("#devices"); if (!el) return;
+  el.innerHTML = devices.map(d => {
+    const pairUrl = `${location.origin}/camera?t=${d.token}`;
+    const open = openPair.has(d.id);
+    const isSrc = editing.camera_source === d.id;
+    return `<div class="bg-slate-900 rounded p-3">
+      <div class="flex flex-wrap items-center gap-2">
+        <span class="w-2.5 h-2.5 rounded-full ${d.online ? "bg-emerald-400" : "bg-slate-600"}"></span>
+        <span class="font-semibold text-sm">${esc(d.name)}</span>
+        <span class="text-xs text-slate-400">${KINDS[d.kind]}${isSrc ? " · active camera" : ""}</span>
+        <span class="text-xs text-slate-500">${d.online ? "online" : (d.seen_ago != null ? `seen ${d.seen_ago}s ago` : "never seen")}</span>
+        <span class="ml-auto flex gap-2 text-xs">
+          <button data-pair="${d.id}" class="px-2 py-1 rounded bg-slate-700">${open ? "Hide" : "Pair"}</button>
+          <button data-deldev="${d.id}" class="px-2 py-1 rounded bg-rose-700">Remove</button>
+        </span>
+      </div>
+      ${open ? `<div class="mt-3 text-xs space-y-2">
+        ${d.kind === "phone" ? `
+          <p>Open this link on the phone (or scan the QR), then tap Start streaming:</p>
+          <a class="text-indigo-400 underline break-all" href="${pairUrl}" target="_blank">${esc(pairUrl)}</a>
+          <div class="qr bg-white p-2 inline-block rounded" data-qr="${esc(pairUrl)}"></div>`
+        : `<p>Enter these on the device's setup page (join its setup hotspot, open 192.168.4.1):</p>
+          <div>Server: <code class="bg-slate-800 px-1 rounded break-all">${esc(location.origin)}</code></div>
+          <div>Token: <code class="bg-slate-800 px-1 rounded break-all select-all">${esc(d.token)}</code></div>`}
+      </div>` : ""}
+    </div>`;
+  }).join("") || `<p class="text-sm text-slate-400">No devices yet.</p>`;
+  el.querySelectorAll("[data-qr]").forEach(q => { if (window.QRCode) new QRCode(q, { text: q.dataset.qr, width: 140, height: 140 }); });
+}
+async function addDevice(e) {
+  e.preventDefault();
+  const f = Object.fromEntries(new FormData(e.target).entries());
+  try {
+    const d = await api(`/api/classes/${editing.id}/devices`, { method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(f) });
+    e.target.reset(); openPair.add(d.id); lastDevJson = ""; loadDevices();
+  } catch (err) { toast(err.message); }
+}
+async function deviceClick(e) {
+  const pair = e.target.dataset.pair, del = e.target.dataset.deldev;
+  if (pair) { openPair.has(pair) ? openPair.delete(pair) : openPair.add(pair); renderDevices(); }
+  if (del) {
+    if (!confirm("Remove this device? Its token stops working.")) return;
+    try {
+      await api(`/api/devices/${del}`, { method: "DELETE" });
+      if (editing.camera_source === del) editing.camera_source = "browser";
+      lastDevJson = ""; loadDevices();
+    } catch (err) { toast(err.message); }
+  }
 }
 
 async function loadRoster() {
