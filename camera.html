@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Phone Camera</title>
+<script src="https://cdn.tailwindcss.com/3.4.17"></script>
+</head>
+<body class="bg-black text-white min-h-screen">
+<div class="p-4 space-y-3 max-w-md mx-auto">
+  <h1 class="text-lg font-bold">Phone camera</h1>
+  <p id="info" class="text-sm text-slate-400">Checking link…</p>
+  <video id="v" autoplay playsinline muted class="w-full rounded bg-slate-900"></video>
+  <canvas id="c" class="hidden"></canvas>
+  <div class="flex gap-2">
+    <button id="go" class="flex-1 px-3 py-2 rounded bg-emerald-600 font-semibold">Start streaming</button>
+    <button id="flip" class="px-3 py-2 rounded bg-slate-700">Flip camera</button>
+  </div>
+  <p id="st" class="text-sm text-slate-300">Ready.</p>
+  <p class="text-xs text-slate-500">Keep this page open and the screen on. Mount the phone facing the students.</p>
+</div>
+<script>
+const $ = s => document.querySelector(s);
+const token = new URLSearchParams(location.search).get("t") || "";
+const v = $("#v"), c = $("#c");
+let on = false, stream = null, facing = "environment", sent = 0, wake = null;
+const st = t => $("#st").textContent = t;
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+(async () => {
+  try {
+    const r = await fetch("/api/device/events", { headers: { "X-Device-Token": token } });
+    if (!r.ok) throw 0;
+    const d = await r.json();
+    $("#info").textContent = `Linked to class: ${d.class_name} (device: ${d.device_name})`;
+  } catch { $("#info").textContent = "Invalid or revoked link. Re-open the pair link from the dashboard."; $("#go").disabled = true; }
+})();
+
+async function openCam() {
+  stream?.getTracks().forEach(t => t.stop());
+  stream = await navigator.mediaDevices.getUserMedia({
+    video: { facingMode: facing, width: { ideal: 640 }, height: { ideal: 480 } }, audio: false });
+  v.srcObject = stream;
+}
+async function pump() {
+  while (on) {
+    const t0 = performance.now();
+    try {
+      if (v.videoWidth) {
+        const k = Math.min(1, 640 / v.videoWidth);
+        c.width = Math.round(v.videoWidth * k); c.height = Math.round(v.videoHeight * k);
+        c.getContext("2d").drawImage(v, 0, 0, c.width, c.height);
+        const blob = await new Promise(r => c.toBlob(r, "image/jpeg", 0.7));
+        const r = await fetch("/api/device/frame", {
+          method: "POST", headers: { "X-Device-Token": token, "Content-Type": "image/jpeg" }, body: blob });
+        if (r.status === 401) { st("Token revoked. Stopped."); on = false; break; }
+        sent++; st(`Streaming… ${sent} frames sent`);
+      }
+    } catch { st("Network issue, retrying…"); }
+    await sleep(Math.max(0, 250 - (performance.now() - t0)));
+  }
+}
+$("#go").onclick = async () => {
+  if (on) { on = false; stream?.getTracks().forEach(t => t.stop()); wake?.release?.(); $("#go").textContent = "Start streaming"; st("Stopped."); return; }
+  try {
+    await openCam(); on = true; $("#go").textContent = "Stop";
+    try { wake = await navigator.wakeLock?.request("screen"); } catch {}
+    pump();
+  } catch (e) { st("Camera error: " + e.message); }
+};
+$("#flip").onclick = async () => { facing = facing === "environment" ? "user" : "environment"; if (on) await openCam().catch(e => st("Camera error: " + e.message)); };
+document.addEventListener("visibilitychange", async () => { if (on && document.visibilityState === "visible") { try { wake = await navigator.wakeLock?.request("screen"); } catch {} } });
+</script>
+</body>
+</html>
