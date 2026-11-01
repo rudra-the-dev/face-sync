@@ -14,6 +14,7 @@
   <button id="startBtn" class="px-3 py-1.5 rounded bg-emerald-600 hover:bg-emerald-500 text-sm font-semibold">Start</button>
   <div class="ml-auto flex flex-wrap gap-2 text-xs">
     <span id="winPill" class="px-2 py-1 rounded bg-slate-700">Idle</span>
+    <span id="camPill" class="px-2 py-1 rounded bg-slate-700">Cam: this device</span>
     <span id="netPill" class="px-2 py-1 rounded bg-slate-700">Online</span>
     <span id="qPill" class="px-2 py-1 rounded bg-slate-700">Queue: 0</span>
   </div>
@@ -22,6 +23,7 @@
 <main class="max-w-3xl mx-auto p-4 space-y-3">
   <div class="relative bg-black rounded-lg overflow-hidden">
     <video id="video" class="w-full block" autoplay playsinline muted></video>
+    <canvas id="remote" class="hidden w-full block"></canvas>
     <canvas id="overlay" class="absolute inset-0 w-full h-full"></canvas>
     <div id="badge" class="hidden absolute bottom-3 left-3 right-3 sm:right-auto sm:w-80 flex items-center gap-3 p-3 rounded-lg shadow-lg"></div>
   </div>
@@ -34,7 +36,8 @@ const MODEL_URL = "https://cdn.jsdelivr.net/npm/@vladmandic/face-api@1.7.13/mode
 const MATCH_THRESHOLD = 0.5;
 const $ = s => document.querySelector(s);
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
-const video = $("#video"), overlay = $("#overlay");
+const video = $("#video"), overlay = $("#overlay"), remoteCv = $("#remote");
+let remote = false, lastSeq = 0, src = null;
 
 let cls = null, matcher = null, roster = {}, running = false, stream = null;
 let marks = new Map(), unknownSince = null, lastUnknownShot = 0, modelsLoaded = false, ac = null;
@@ -104,7 +107,7 @@ function localBlocked(c, id) {
 
 // ---------- feedback ----------
 function chime() {
-  if (!ac) return;
+  if (!ac || cls?.audio_local === false) return;
   const t = ac.currentTime;
   [[880, 0], [1318.5, 0.12]].forEach(([f, d]) => {
     const o = ac.createOscillator(), g = ac.createGain();
@@ -185,9 +188,32 @@ function drawBoxes(items) {
   }
 }
 
+async function pullFrame() {
+  try {
+    const r = await fetch(`/api/classes/${cls.id}/frame?after=${lastSeq}`, { cache: "no-store" });
+    if (r.status === 200) {
+      lastSeq = r.headers.get("X-Frame-Seq");
+      const bmp = await createImageBitmap(await r.blob());
+      if (remoteCv.width !== bmp.width || remoteCv.height !== bmp.height) {
+        remoteCv.width = overlay.width = bmp.width; remoteCv.height = overlay.height = bmp.height;
+      }
+      remoteCv.getContext("2d").drawImage(bmp, 0, 0); bmp.close();
+      setCam(true); return true;
+    }
+    setCam(r.headers.get("X-Camera-Online") === "1");
+  } catch { setCam(false); }
+  return false;
+}
+function setCam(online) {
+  const p = $("#camPill");
+  p.textContent = online ? "Cam: linked ●" : "Cam: linked – no signal";
+  p.className = "px-2 py-1 rounded " + (online ? "bg-emerald-700" : "bg-rose-700");
+}
+
 async function loop() {
   if (!running) return;
   try {
+    const frameReady = remote ? await pullFrame() : true;
     const active = windowActive(cls);
     const pill = $("#winPill");
     pill.textContent = active ? `Scanning (${cls.start_time}–${cls.end_time})` : `Outside window (${cls.start_time}–${cls.end_time})`;
@@ -195,8 +221,8 @@ async function loop() {
 
     if (!active) {
       drawBoxes([]); unknownSince = null;
-    } else if (video.readyState >= 2) {
-      const dets = await faceapi.detectAllFaces(video, new faceapi.TinyFaceDetectorOptions({ inputSize: 320, scoreThreshold: 0.5 }))
+    } else if (remote ? frameReady : video.readyState >= 2) {
+      const dets = await faceapi.detectAllFaces(src, new faceapi.TinyFaceDetectorOptions({ inputSize: 320, scoreThreshold: 0.5 }))
         .withFaceLandmarks().withFaceDescriptors();
       const items = []; let anyUnknown = false;
       for (const d of dets) {
@@ -222,15 +248,15 @@ async function loop() {
         if (Date.now() - unknownSince >= cls.unknown_threshold_sec * 1000 && Date.now() - lastUnknownShot > 60000) {
           lastUnknownShot = Date.now();
           const c = document.createElement("canvas");
-          c.width = video.videoWidth; c.height = video.videoHeight;
-          c.getContext("2d").drawImage(video, 0, 0);
+          c.width = remote ? src.width : src.videoWidth; c.height = remote ? src.height : src.videoHeight;
+          c.getContext("2d").drawImage(src, 0, 0);
           await send("unknown", { class_id: cls.id, snapshot: c.toDataURL("image/jpeg", 0.8) });
           addEvent(`${new Date().toLocaleTimeString()} – Unknown visitor captured`);
         }
       } else unknownSince = null;
     }
   } catch (e) { console.error(e); }
-  setTimeout(loop, 350);
+  setTimeout(loop, remote ? 200 : 350);
 }
 
 // ---------- start / stop ----------
@@ -246,11 +272,21 @@ async function start() {
     localStorage.setItem("class:" + cls.id, JSON.stringify(cls));
     setStatus("Loading face models…"); await loadModels();
     await buildMatcher();
-    setStatus("Starting camera…");
-    stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "user", width: 640, height: 480 }, audio: false });
-    video.srcObject = stream;
-    await new Promise(r => video.onloadedmetadata = r);
-    overlay.width = video.videoWidth; overlay.height = video.videoHeight;
+    remote = !!cls.camera_source && cls.camera_source !== "browser";
+    video.classList.toggle("hidden", remote); remoteCv.classList.toggle("hidden", !remote);
+    src = remote ? remoteCv : video; lastSeq = 0;
+    if (remote) {
+      setStatus("Waiting for the linked camera…");
+      remoteCv.width = overlay.width = 640; remoteCv.height = overlay.height = 480;
+      setCam(false);
+    } else {
+      $("#camPill").textContent = "Cam: this device"; $("#camPill").className = "px-2 py-1 rounded bg-slate-700";
+      setStatus("Starting camera…");
+      stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "user", width: 640, height: 480 }, audio: false });
+      video.srcObject = stream;
+      await new Promise(r => video.onloadedmetadata = r);
+      overlay.width = video.videoWidth; overlay.height = video.videoHeight;
+    }
     running = true; marks.clear(); unknownSince = null;
     $("#startBtn").textContent = "Stop"; setStatus(`Scanning for ${cls.name}.`);
     loop();
