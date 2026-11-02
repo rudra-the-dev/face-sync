@@ -1,6 +1,12 @@
 #password for the website
 
 #oyQWXP-Sk_Ju8Fl
+
+#url
+
+#https://facesync-mwgq.onrender.com
+
+
 import base64
 import csv
 import hmac
