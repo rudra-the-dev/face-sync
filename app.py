@@ -26,7 +26,22 @@ ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
 app = Flask(__name__, static_folder=None)
 app.config["MAX_CONTENT_LENGTH"] = 8 * 1024 * 1024
 
-mongo = MongoClient(os.environ["MONGODB_URI"], tz_aware=True)
+MONGODB_URI = os.environ.get("MONGODB_URI", "").strip()
+if MONGODB_URI:
+    PERSISTENT = True
+    mongo = MongoClient(MONGODB_URI, tz_aware=True, serverSelectionTimeoutMS=8000)
+    try:
+        mongo.admin.command("ping")
+    except Exception as ex:
+        print("MONGODB CONNECTION FAILED:", ex, flush=True)
+        print("Check: Atlas Network Access allows 0.0.0.0/0, DB user/password in the URI, "
+              "special characters in the password are URL-encoded.", flush=True)
+        raise
+else:
+    import mongomock  # local testing only: everything is lost when the server restarts
+    PERSISTENT = False
+    mongo = mongomock.MongoClient(tz_aware=True)
+    print("WARNING: MONGODB_URI is not set. Using a temporary in-memory database.", flush=True)
 db = mongo[os.environ.get("MONGODB_DB", "attendance")]
 classes, students, logs, devices = db.classes, db.students, db.logs, db.devices
 logs.create_index([("class_id", 1), ("timestamp", -1)])
@@ -213,6 +228,11 @@ def page_scan():
 @app.get("/healthz")
 def healthz():
     return "ok"
+
+
+@app.get("/api/storage")
+def storage_info():
+    return jsonify(persistent=PERSISTENT)
 
 
 # ---------- classes ----------
