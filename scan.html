@@ -50,7 +50,7 @@ const idb = new Promise((res, rej) => {
 });
 const tx = (mode, fn) => idb.then(db => new Promise((res, rej) => {
   const t = db.transaction("q", mode); const r = fn(t.objectStore("q"));
-  t.oncomplete = () => res(r.result); t.onerror = () => rej(t.error);
+  t.oncomplete = () => res(r.result); t.onerror = () => rej(r.error);
 }));
 const qPut = i => tx("readwrite", s => s.put(i));
 const qDel = k => tx("readwrite", s => s.delete(k));
@@ -67,7 +67,7 @@ async function flush() {
         const r = await fetch(item.kind === "unknown" ? "/api/unknown" : "/api/attendance", {
           method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(item.body) });
         if (r.status >= 500) break;
-        await qDel(item.client_id); // success, duplicate, or permanent 4xx
+        await qDel(item.client_id);
       } catch { break; }
     }
   } finally { flushing = false; updateQueueCount(); }
@@ -89,7 +89,7 @@ async function send(kind, body) {
   }
 }
 
-// ---------- time window + anti-spam (client side mirror; server is authoritative) ----------
+// ---------- time window + anti-spam ----------
 const localHM = tz => new Intl.DateTimeFormat("en-GB", { timeZone: tz, hour: "2-digit", minute: "2-digit", hourCycle: "h23" }).format(new Date());
 const dayKey = tz => new Intl.DateTimeFormat("en-CA", { timeZone: tz }).format(new Date());
 function windowActive(c) {
@@ -139,8 +139,25 @@ function addEvent(t) {
 const setStatus = t => $("#status").textContent = t;
 
 // ---------- roster + descriptors ----------
+let backendName = "";
+async function initBackend() {
+  const tf = faceapi.tf;
+  if (!tf) return;
+  // setBackend() resolves to false (it does not throw) when a backend cannot start,
+  // e.g. WebGL on an old GPU. Trying webgl, then cpu, keeps the wasm backend out of it.
+  for (const b of ["webgl", "cpu"]) {
+    let ok = false;
+    try { ok = await tf.setBackend(b); } catch (e) { ok = false; }
+    if (ok) break;
+  }
+  await tf.ready();
+  backendName = tf.getBackend();
+}
 async function loadModels() {
   if (modelsLoaded) return;
+  
+  await initBackend();
+
   await Promise.all([
     faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL),
     faceapi.nets.faceLandmark68Net.loadFromUri(MODEL_URL),
@@ -148,6 +165,7 @@ async function loadModels() {
   ]);
   modelsLoaded = true;
 }
+
 async function buildMatcher() {
   let list;
   try {
@@ -222,7 +240,7 @@ async function loop() {
     if (!active) {
       drawBoxes([]); unknownSince = null;
     } else if (remote ? frameReady : video.readyState >= 2) {
-      const dets = await faceapi.detectAllFaces(src, new faceapi.TinyFaceDetectorOptions({ inputSize: 320, scoreThreshold: 0.5 }))
+      const dets = await faceapi.detectAllFaces(src, new faceapi.TinyFaceDetectorOptions({ inputSize: backendName === "cpu" ? 224 : 320, scoreThreshold: 0.5 }))
         .withFaceLandmarks().withFaceDescriptors();
       const items = []; let anyUnknown = false;
       for (const d of dets) {
@@ -256,7 +274,7 @@ async function loop() {
       } else unknownSince = null;
     }
   } catch (e) { console.error(e); }
-  setTimeout(loop, remote ? 200 : 350);
+  setTimeout(loop, remote ? 200 : (backendName === "cpu" ? 700 : 350));
 }
 
 // ---------- start / stop ----------
@@ -264,13 +282,14 @@ async function start() {
   if (!$("#classSel").value) return setStatus("Create a class on the dashboard first.");
   $("#startBtn").disabled = true;
   try {
-    ac = new (window.AudioContext || window.webkitAudioContext)(); // needs the click gesture
+    ac = new (window.AudioContext || window.webkitAudioContext)();
     setStatus("Loading class…");
     const all = await (await fetch("/api/classes")).json().catch(() => []);
     cls = all.find(c => c.id === $("#classSel").value) || JSON.parse(localStorage.getItem("class:" + $("#classSel").value) || "null");
     if (!cls) throw new Error("Could not load class (offline and not cached).");
     localStorage.setItem("class:" + cls.id, JSON.stringify(cls));
     setStatus("Loading face models…"); await loadModels();
+    addEvent("Face engine: " + (backendName === "cpu" ? "CPU (slow-device mode)" : backendName || "default"));
     await buildMatcher();
     remote = !!cls.camera_source && cls.camera_source !== "browser";
     video.classList.toggle("hidden", remote); remoteCv.classList.toggle("hidden", !remote);
